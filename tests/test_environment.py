@@ -141,6 +141,34 @@ async def test_start_prebuilt_image_maps_resources_and_network(tmp_path: Path) -
     )
 
 
+async def test_start_creates_configured_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client()
+    environment = _environment(
+        tmp_path,
+        task_config=EnvironmentConfig(
+            docker_image="alpine:latest",
+            workdir="/workspace with spaces",
+        ),
+        client=client,
+    )
+    execute = AsyncMock(return_value=SimpleNamespace(output=b"", exit_code=0))
+    monkeypatch.setattr(environment_module, "exec_async", execute)
+
+    await environment.start(force_build=False)
+
+    args = execute.await_args
+    if args is None:
+        raise AssertionError("workdir command was not executed")
+    assert args.args[:3] == (
+        client,
+        "instance-1",
+        ["/bin/sh", "-lc", "mkdir -p '/workspace with spaces'"],
+    )
+    assert args.kwargs["cwd"] == "/"
+
+
 async def test_start_builds_dockerfile_context(tmp_path: Path) -> None:
     client = _client()
     client.builds.create.return_value = SimpleNamespace(

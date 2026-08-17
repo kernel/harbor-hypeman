@@ -143,6 +143,7 @@ class HypemanEnvironment(BaseEnvironment):
                 api_timeout="5m",
                 timeout=310,
             )
+            await self._ensure_workdir()
             await self.ensure_dirs(self._mount_targets(writable_only=True))
             await self._upload_environment_dir_after_start()
         except BaseException:
@@ -157,6 +158,21 @@ class HypemanEnvironment(BaseEnvironment):
             finally:
                 self._instance_id = None
             raise
+
+    async def _ensure_workdir(self) -> None:
+        workdir = self.task_env_config.workdir
+        if workdir is None:
+            return
+        result = await self.exec(
+            f"mkdir -p {shlex.quote(workdir)}",
+            cwd="/",
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"Failed to create Hypeman workdir {workdir!r}: "
+                f"{result.stdout or 'no output'}"
+            )
 
     async def _prepare_image(self, force_build: bool) -> str:
         docker_image = self.task_env_config.docker_image
