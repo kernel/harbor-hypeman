@@ -13,6 +13,10 @@ dependencies = [
   "pathspec>=1.0.3",
 ]
 
+[project.urls]
+Repository = "https://github.com/kernel/harbor-hypeman"
+Changelog = "https://github.com/kernel/harbor-hypeman/blob/main/CHANGELOG.md"
+
 [dependency-groups]
 dev = [
   "pytest>=8.4.2",
