@@ -315,7 +315,7 @@ class HypemanEnvironment(BaseEnvironment):
         result = await exec_async(
             self._client,
             self._require_instance(),
-            ["/bin/sh", "-lc", command],
+            ["/bin/bash", "-lc", command],
             cwd=effective_exec_cwd(
                 cwd,
                 self.task_env_config.workdir,
