@@ -36,42 +36,6 @@ The backend supports task environments defined by either:
 
 CPU, memory, and storage values map to Hypeman vCPUs, base memory, and writable overlay size. Harbor `public` and `no-network` modes map to attached and detached Hypeman networking.
 
-## Braintrust reporting
-
-Install the official Braintrust integration with the backend:
-
-```bash
-uv tool install harbor \
-  --with harbor-hypeman \
-  --with 'braintrust>=0.33.0'
-```
-
-Then add the official Harbor plugin to a run:
-
-```bash
-harbor run \
-  --dataset ./tasks \
-  --agent codex \
-  --model openai/gpt-5.6 \
-  --env harbor_hypeman:HypemanEnvironment \
-  --plugin braintrust
-```
-
-Set the Braintrust credentials required by your project before running the command.
-
-This repository includes two pinned `kernel-mcp-server` tasks for reproducible backend and reporting checks:
-
-```bash
-harbor run \
-  --dataset ./evals/kernel-mcp-server \
-  --agent codex \
-  --model openai/gpt-5.6 \
-  --env harbor_hypeman:HypemanEnvironment \
-  --plugin braintrust
-```
-
-The tasks start from fixed source commits and use focused hidden Bun tests for browser-region forwarding and MCP client-capability parsing.
-
 ## Behavior
 
 - Dockerfile builds are cached by Harbor environment content hash and rebuilt with `--force-build`.
