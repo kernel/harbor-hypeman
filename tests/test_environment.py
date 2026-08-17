@@ -164,7 +164,7 @@ async def test_start_creates_configured_workdir(
     assert args.args[:3] == (
         client,
         "instance-1",
-        ["/bin/sh", "-lc", "mkdir -p '/workspace with spaces'"],
+        ["/bin/bash", "-lc", "mkdir -p '/workspace with spaces'"],
     )
     assert args.kwargs["cwd"] == "/"
 
@@ -325,7 +325,7 @@ async def test_exec_uses_shell_workdir_environment_and_user(
     assert args.args[:3] == (
         client,
         "instance-1",
-        ["/bin/sh", "-lc", "su agent -s /bin/sh -c 'printf test'"],
+        ["/bin/bash", "-lc", "su agent -s /bin/sh -c 'printf test'"],
     )
     assert args.kwargs == {
         "cwd": "/workspace",
