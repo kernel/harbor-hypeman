@@ -241,6 +241,27 @@ async def test_start_reuses_ready_build(tmp_path: Path) -> None:
     )
 
 
+def test_build_archive_honors_dockerignore(tmp_path: Path) -> None:
+    source_dir = tmp_path / "environment"
+    source_dir.mkdir()
+    (source_dir / "Dockerfile").write_text("FROM alpine:3.22\n")
+    (source_dir / ".dockerignore").write_text(
+        "Dockerfile\n.dockerignore\nsecret.txt\nignored/\n"
+    )
+    (source_dir / "keep.txt").write_text("keep")
+    (source_dir / "secret.txt").write_text("secret")
+    (source_dir / "ignored").mkdir()
+    (source_dir / "ignored" / "file.txt").write_text("ignored")
+    archive_path = tmp_path / "environment.tar.gz"
+
+    HypemanEnvironment._write_build_archive(source_dir, archive_path)
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        names = set(archive.getnames())
+    assert {"Dockerfile", ".dockerignore", "keep.txt"} <= names
+    assert {"secret.txt", "ignored", "ignored/file.txt"}.isdisjoint(names)
+
+
 async def test_exec_uses_shell_workdir_environment_and_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

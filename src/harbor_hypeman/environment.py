@@ -34,6 +34,7 @@ from hypeman.lib import (
     cp_to_instance_async,
     exec_async,
 )
+from pathspec import GitIgnoreSpec
 
 _BUILD_TAG = "harbor.environment_id"
 _TERMINAL_BUILD_STATES = frozenset({"failed", "cancelled"})
@@ -232,12 +233,28 @@ class HypemanEnvironment(BaseEnvironment):
 
     @staticmethod
     def _write_build_archive(source_dir: Path, archive_path: Path) -> None:
+        dockerignore_path = source_dir / ".dockerignore"
+        dockerignore = (
+            GitIgnoreSpec.from_lines(dockerignore_path.read_text().splitlines())
+            if dockerignore_path.is_file()
+            else None
+        )
+
         with tarfile.open(archive_path, "w:gz") as archive:
             for path in sorted(source_dir.rglob("*")):
                 relative = path.relative_to(source_dir)
                 if {".git", "__pycache__"} & set(relative.parts):
                     continue
-                archive.add(path, arcname=relative.as_posix(), recursive=False)
+                archive_name = relative.as_posix()
+                if (
+                    dockerignore is not None
+                    and archive_name not in {"Dockerfile", ".dockerignore"}
+                    and dockerignore.match_file(
+                        f"{archive_name}/" if path.is_dir() else archive_name
+                    )
+                ):
+                    continue
+                archive.add(path, arcname=archive_name, recursive=False)
 
     def _instance_name(self) -> str:
         session = re.sub(r"[^a-z0-9]+", "-", self.session_id.lower()).strip("-")

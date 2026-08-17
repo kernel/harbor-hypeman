@@ -10,6 +10,7 @@ dependencies = [
   "dockerfile-parse>=2.0.1",
   "harbor>=0.21.0,<0.22",
   "hypeman>=0.1.0,<0.2",
+  "pathspec>=1.0.3",
 ]
 
 [project.optional-dependencies]

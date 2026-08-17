@@ -770,6 +770,7 @@ dependencies = [
     { name = "dockerfile-parse" },
     { name = "harbor" },
     { name = "hypeman" },
+    { name = "pathspec" },
 ]
 
 [package.optional-dependencies]
@@ -791,6 +792,7 @@ requires-dist = [
     { name = "dockerfile-parse", specifier = ">=2.0.1" },
     { name = "harbor", specifier = ">=0.21.0,<0.22" },
     { name = "hypeman", specifier = ">=0.1.0,<0.2" },
+    { name = "pathspec", specifier = ">=1.0.3" },
 ]
 provides-extras = ["braintrust"]
 
