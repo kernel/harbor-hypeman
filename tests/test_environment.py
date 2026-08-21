@@ -8,13 +8,14 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from harbor.environments.base import SandboxBuildFailedError
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.config import EnvironmentConfig as TrialEnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
-from hypeman import AsyncHypeman
+from hypeman import AsyncHypeman, NotFoundError
 
 import harbor_hypeman.environment as environment_module
 from harbor_hypeman import HypemanEnvironment
@@ -25,7 +26,10 @@ def _client() -> Any:
     client.images.create = AsyncMock(
         return_value=SimpleNamespace(name="docker.io/library/alpine:latest")
     )
-    client.images.get = AsyncMock()
+    response = httpx.Response(404, request=httpx.Request("GET", "https://example.com"))
+    client.images.get = AsyncMock(
+        side_effect=NotFoundError("missing", response=response, body=None)
+    )
     client.builds.list = AsyncMock(return_value=[])
     client.builds.create = AsyncMock()
     client.builds.get = AsyncMock()
@@ -131,14 +135,37 @@ async def test_start_prebuilt_image_maps_resources_and_network(tmp_path: Path) -
     assert create_kwargs["size"] == "2048MB"
     assert create_kwargs["overlay_size"] == "4096MB"
     assert create_kwargs["network"] == {"enabled": False}
-    assert create_kwargs["env"] == {"TASK_ENV": "value"}
     assert create_kwargs["name"].startswith("harbor-test-task-abc123-env-")
+    assert create_kwargs["env"] == {
+        "TASK_ENV": "value",
+        "HYPEMAN_INSTANCE_NAME": create_kwargs["name"],
+    }
     client.instances.wait.assert_awaited_once_with(
         "instance-1",
         state="Running",
         api_timeout="5m",
         timeout=310,
     )
+
+
+async def test_start_uses_existing_prebuilt_image(tmp_path: Path) -> None:
+    client = _client()
+    client.images.get.side_effect = None
+    client.images.get.return_value = SimpleNamespace(
+        name="docker.io/builds/build-1:latest",
+        status="ready",
+    )
+    environment = _environment(
+        tmp_path,
+        task_config=EnvironmentConfig(docker_image="builds/build-1"),
+        client=client,
+    )
+
+    await environment.start(force_build=False)
+
+    client.images.get.assert_awaited_once_with("builds/build-1")
+    client.images.create.assert_not_awaited()
+    assert client.instances.create.await_args.kwargs["image"] == "builds/build-1"
 
 
 async def test_start_creates_configured_workdir(
@@ -247,6 +274,7 @@ async def test_start_failure_deletes_created_instance(tmp_path: Path) -> None:
 
 async def test_start_reuses_ready_build(tmp_path: Path) -> None:
     client = _client()
+    client.images.get.side_effect = None
     client.builds.list.return_value = [
         SimpleNamespace(
             status="ready",
