@@ -110,12 +110,16 @@ class HypemanEnvironment(BaseEnvironment):
             raise RuntimeError("Hypeman environment is already started.")
 
         image = await self._prepare_image(force_build)
+        instance_name = self._instance_name()
         instance = await self._client.instances.create(
             image=image,
-            name=self._instance_name(),
+            name=instance_name,
             entrypoint=["/bin/sh", "-c"],
             cmd=["while true; do sleep 3600; done"],
-            env=self._startup_env(),
+            env={
+                **self._startup_env(),
+                "HYPEMAN_INSTANCE_NAME": instance_name,
+            },
             network={"enabled": self.network_policy.network_mode == NetworkMode.PUBLIC},
             tags={
                 "harbor.managed": "true",
@@ -183,11 +187,15 @@ class HypemanEnvironment(BaseEnvironment):
         ):
             if docker_image is None:
                 raise RuntimeError("Prebuilt image selection requires docker_image.")
-            image = await self._client.images.create(
-                name=docker_image,
-                tags={_BUILD_TAG: self.environment_id},
-            )
-            return image.name
+            try:
+                await self._client.images.get(docker_image)
+                return docker_image
+            except NotFoundError:
+                image = await self._client.images.create(
+                    name=docker_image,
+                    tags={_BUILD_TAG: self.environment_id},
+                )
+                return image.name
 
         if not force_build:
             cached_image = await self._cached_build_image()
