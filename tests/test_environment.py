@@ -429,8 +429,14 @@ async def test_durable_exec_detaches_and_reconnects_while_polling(
     }
     assert all(
         call.kwargs == {"cwd": "/", "timeout": 10}
-        for call in execute.await_args_list[1:]
+        for call in (
+            execute.await_args_list[1],
+            execute.await_args_list[2],
+            execute.await_args_list[3],
+            execute.await_args_list[5],
+        )
     )
+    assert execute.await_args_list[4].kwargs == {"cwd": "/", "timeout": None}
     assert sleep.await_count == 2
 
 
@@ -445,12 +451,15 @@ async def test_durable_exec_terminates_detached_job_on_timeout(
     execute = AsyncMock(
         side_effect=[
             SimpleNamespace(output=b"", exit_code=0),
+            ExecProtocolError("control connection closed"),
             SimpleNamespace(output=b"", exit_code=0),
             SimpleNamespace(output=b"partial output", exit_code=0),
             SimpleNamespace(output=b"", exit_code=0),
         ]
     )
+    sleep = AsyncMock()
     monkeypatch.setattr(environment_module, "exec_async", execute)
+    monkeypatch.setattr(environment_module.asyncio, "sleep", sleep)
     monkeypatch.setattr(
         environment_module.uuid,
         "uuid4",
@@ -460,11 +469,13 @@ async def test_durable_exec_terminates_detached_job_on_timeout(
     result = await environment.exec("sleep 60", timeout_sec=0)
 
     assert result == ExecResult(stdout="partial output", stderr=None, return_code=124)
-    assert execute.await_count == 4
-    terminate_command = execute.await_args_list[1].args[2][2]
-    assert 'kill -TERM -- "-$pid"' in terminate_command
-    cleanup_command = execute.await_args_list[3].args[2][2]
+    assert execute.await_count == 5
+    terminate_commands = [execute.await_args_list[index].args[2][2] for index in (1, 2)]
+    assert all('kill -TERM -- "-$pid"' in command for command in terminate_commands)
+    assert execute.await_args_list[3].kwargs == {"cwd": "/", "timeout": None}
+    cleanup_command = execute.await_args_list[4].args[2][2]
     assert "rm -rf /tmp/harbor-hypeman-exec/timed-out-job" in cleanup_command
+    assert sleep.await_count == 1
 
 
 async def test_file_transfers_preserve_harbor_target_semantics(

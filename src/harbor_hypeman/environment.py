@@ -441,7 +441,13 @@ class DurableHypemanEnvironment(HypemanEnvironment):
             current = current.__cause__ or current.__context__
         return False
 
-    async def _control_exec(self, command: str, *, retry: bool = False) -> Any:
+    async def _control_exec(
+        self,
+        command: str,
+        *,
+        retry: bool = False,
+        timeout: int | None = 10,
+    ) -> Any:
         deadline = (
             asyncio.get_running_loop().time() + _DURABLE_EXEC_RECONNECT_TIMEOUT_SEC
         )
@@ -452,7 +458,7 @@ class DurableHypemanEnvironment(HypemanEnvironment):
                     self._require_instance(),
                     ["/bin/bash", "-lc", command],
                     cwd="/",
-                    timeout=10,
+                    timeout=timeout,
                 )
             except Exception as error:
                 if (
@@ -483,7 +489,7 @@ if [ -s {shlex.quote(pid_path)} ]; then
 fi
 """
         try:
-            await self._control_exec(command)
+            await self._control_exec(command, retry=True)
         except Exception:
             self.logger.warning("Failed to terminate durable exec job %s", job_dir)
 
@@ -504,7 +510,7 @@ exit "$status"
             command = (
                 f"[ ! -f {shlex.quote(output_path)} ] || cat {shlex.quote(output_path)}"
             )
-        result = await self._control_exec(command, retry=True)
+        result = await self._control_exec(command, retry=True, timeout=None)
         exec_result = await self._exec_result(result)
         if return_code is not None:
             exec_result = ExecResult(
@@ -600,7 +606,9 @@ exit 2
             if launched:
                 await self._terminate_job(job_dir, pid_path)
                 try:
-                    await self._control_exec(f"rm -rf {shlex.quote(job_dir)}")
+                    await self._control_exec(
+                        f"rm -rf {shlex.quote(job_dir)}", retry=True
+                    )
                 except Exception:
                     self.logger.warning("Failed to remove durable exec job %s", job_dir)
             raise
