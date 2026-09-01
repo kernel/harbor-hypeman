@@ -1,3 +1,3 @@
-from .environment import DurableHypemanEnvironment, HypemanEnvironment
+from .environment import HypemanEnvironment
 
-__all__ = ["DurableHypemanEnvironment", "HypemanEnvironment"]
+__all__ = ["HypemanEnvironment"]

@@ -46,9 +46,9 @@ from pathspec import GitIgnoreSpec
 
 _BUILD_TAG = "harbor.environment_id"
 _TERMINAL_BUILD_STATES = frozenset({"failed", "cancelled"})
-_DURABLE_EXEC_ROOT = "/tmp/harbor-hypeman-exec"
-_DURABLE_EXEC_POLL_INTERVAL_SEC = 1.0
-_DURABLE_EXEC_RECONNECT_TIMEOUT_SEC = 60.0
+_EXEC_JOB_ROOT = "/tmp/harbor-hypeman-exec"
+_EXEC_POLL_INTERVAL_SEC = 1.0
+_EXEC_RECONNECT_TIMEOUT_SEC = 60.0
 
 
 class HypemanEnvironment(BaseEnvironment):
@@ -339,25 +339,6 @@ class HypemanEnvironment(BaseEnvironment):
         return ExecResult(stdout=output, stderr=None, return_code=result.exit_code)
 
     @override
-    async def exec(
-        self,
-        command: str,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_sec: int | None = None,
-        user: str | int | None = None,
-    ) -> ExecResult:
-        result = await exec_async(
-            self._client,
-            self._require_instance(),
-            ["/bin/bash", "-lc", self._exec_command(command, user)],
-            cwd=self._exec_cwd(cwd),
-            env=self._merge_env(env),
-            timeout=timeout_sec,
-        )
-        return await self._exec_result(result)
-
-    @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         await cp_to_instance_async(
             self._client,
@@ -418,10 +399,6 @@ class HypemanEnvironment(BaseEnvironment):
                 )
             shutil.copytree(downloaded, target, dirs_exist_ok=True)
 
-
-class DurableHypemanEnvironment(HypemanEnvironment):
-    """Run commands independently of their Hypeman exec WebSocket."""
-
     @staticmethod
     def _is_transient_control_error(error: BaseException) -> bool:
         current: BaseException | None = error
@@ -463,14 +440,14 @@ class DurableHypemanEnvironment(HypemanEnvironment):
                     raise
                 now = asyncio.get_running_loop().time()
                 if reconnect_deadline is None:
-                    reconnect_deadline = now + _DURABLE_EXEC_RECONNECT_TIMEOUT_SEC
+                    reconnect_deadline = now + _EXEC_RECONNECT_TIMEOUT_SEC
                 if now >= reconnect_deadline:
                     raise
-                await asyncio.sleep(_DURABLE_EXEC_POLL_INTERVAL_SEC)
+                await asyncio.sleep(_EXEC_POLL_INTERVAL_SEC)
 
     @staticmethod
     def _job_paths(job_id: str) -> tuple[str, str, str, str]:
-        job_dir = f"{_DURABLE_EXEC_ROOT}/{job_id}"
+        job_dir = f"{_EXEC_JOB_ROOT}/{job_id}"
         return (
             job_dir,
             f"{job_dir}/pid",
@@ -490,7 +467,7 @@ fi
         try:
             await self._control_exec(command, retry=True)
         except Exception:
-            self.logger.warning("Failed to terminate durable exec job %s", job_dir)
+            self.logger.warning("Failed to terminate exec job %s", job_dir)
 
     async def _read_job_result(
         self,
@@ -520,7 +497,7 @@ exit "$status"
         try:
             await self._control_exec(f"rm -rf {shlex.quote(job_dir)}", retry=True)
         except Exception:
-            self.logger.warning("Failed to remove durable exec job %s", job_dir)
+            self.logger.warning("Failed to remove exec job %s", job_dir)
         return exec_result
 
     @override
@@ -546,7 +523,7 @@ exit "$status"
         launcher = f"""
 set -eu
 umask 077
-mkdir -p {shlex.quote(_DURABLE_EXEC_ROOT)}
+mkdir -p {shlex.quote(_EXEC_JOB_ROOT)}
 mkdir {shlex.quote(job_dir)}
 if command -v setsid >/dev/null 2>&1; then
   nohup setsid /bin/bash -c {shlex.quote(worker)} \
@@ -598,9 +575,9 @@ exit 2
                     return await self._read_job_result(job_dir, output_path, exit_path)
                 if status.exit_code == 2:
                     raise RuntimeError(
-                        f"Durable exec job {job_id} exited without recording a status"
+                        f"Hypeman exec job {job_id} exited without recording a status"
                     )
-                await asyncio.sleep(_DURABLE_EXEC_POLL_INTERVAL_SEC)
+                await asyncio.sleep(_EXEC_POLL_INTERVAL_SEC)
         except BaseException:
             if launched:
                 await self._terminate_job(job_dir, pid_path)
@@ -609,5 +586,5 @@ exit 2
                         f"rm -rf {shlex.quote(job_dir)}", retry=True
                     )
                 except Exception:
-                    self.logger.warning("Failed to remove durable exec job %s", job_dir)
+                    self.logger.warning("Failed to remove exec job %s", job_dir)
             raise

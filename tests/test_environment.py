@@ -19,7 +19,7 @@ from hypeman import AsyncHypeman, NotFoundError
 from hypeman.lib import ExecProtocolError
 
 import harbor_hypeman.environment as environment_module
-from harbor_hypeman import DurableHypemanEnvironment, HypemanEnvironment
+from harbor_hypeman import HypemanEnvironment
 
 
 def _client() -> Any:
@@ -49,7 +49,6 @@ def _environment(
     network_policy: NetworkPolicy | None = None,
     client: Any | None = None,
     dockerfile: str | None = None,
-    environment_class: type[HypemanEnvironment] = HypemanEnvironment,
 ) -> HypemanEnvironment:
     environment_dir = tmp_path / "environment"
     environment_dir.mkdir()
@@ -57,7 +56,7 @@ def _environment(
         (environment_dir / "Dockerfile").write_text(dockerfile)
     trial_paths = TrialPaths(tmp_path / "trial")
     trial_paths.mkdir()
-    return environment_class(
+    return HypemanEnvironment(
         environment_dir=environment_dir,
         environment_name="test-task",
         session_id="Test_Task__abc123__env",
@@ -87,17 +86,6 @@ def test_custom_environment_loads_from_import_path(tmp_path: Path) -> None:
 
     assert isinstance(result, HypemanEnvironment)
     assert result.type() == "hypeman"
-
-    durable = EnvironmentFactory.create_environment_from_config(
-        TrialEnvironmentConfig(import_path="harbor_hypeman:DurableHypemanEnvironment"),
-        environment_dir=environment_dir,
-        environment_name="test-task",
-        session_id="durable-session",
-        trial_paths=trial_paths,
-        task_env_config=EnvironmentConfig(docker_image="alpine:latest"),
-        hypeman_client=cast(AsyncHypeman, _client()),
-    )
-    assert isinstance(durable, DurableHypemanEnvironment)
 
 
 def test_capabilities_cover_limits_and_static_no_network(tmp_path: Path) -> None:
@@ -198,15 +186,11 @@ async def test_start_creates_configured_workdir(
 
     await environment.start(force_build=False)
 
-    args = execute.await_args
-    if args is None:
-        raise AssertionError("workdir command was not executed")
-    assert args.args[:3] == (
-        client,
-        "instance-1",
-        ["/bin/bash", "-lc", "mkdir -p '/workspace with spaces'"],
-    )
-    assert args.kwargs["cwd"] == "/"
+    launch = execute.await_args_list[0]
+    assert launch.args[:2] == (client, "instance-1")
+    assert "mkdir -p" in launch.args[2][2]
+    assert "workspace with spaces" in launch.args[2][2]
+    assert launch.kwargs["cwd"] == "/"
 
 
 async def test_start_builds_dockerfile_context(tmp_path: Path) -> None:
@@ -331,7 +315,7 @@ def test_build_archive_honors_dockerignore(tmp_path: Path) -> None:
     assert {"secret.txt", "ignored", "ignored/file.txt"}.isdisjoint(names)
 
 
-async def test_exec_uses_shell_workdir_environment_and_user(
+async def test_exec_detaches_and_reconnects_while_polling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = _client()
@@ -343,51 +327,6 @@ async def test_exec_uses_shell_workdir_environment_and_user(
             env={"PERSISTENT": "one"},
         ),
         client=client,
-    )
-    environment._instance_id = "instance-1"
-    execute = AsyncMock(
-        return_value=SimpleNamespace(output=b"combined output\n", exit_code=7)
-    )
-    monkeypatch.setattr(environment_module, "exec_async", execute)
-
-    result = await environment.exec(
-        "printf test",
-        env={"PER_COMMAND": "two"},
-        user="agent",
-        timeout_sec=15,
-    )
-
-    assert result.stdout == "combined output\n"
-    assert result.stderr is None
-    assert result.return_code == 7
-    args = execute.await_args
-    if args is None:
-        raise AssertionError("exec_async was not awaited")
-    assert args.args[:3] == (
-        client,
-        "instance-1",
-        ["/bin/bash", "-lc", "su agent -s /bin/sh -c 'printf test'"],
-    )
-    assert args.kwargs == {
-        "cwd": "/workspace",
-        "env": {"PERSISTENT": "one", "PER_COMMAND": "two"},
-        "timeout": 15,
-    }
-
-
-async def test_durable_exec_detaches_and_reconnects_while_polling(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client = _client()
-    environment = _environment(
-        tmp_path,
-        task_config=EnvironmentConfig(
-            docker_image="alpine:latest",
-            workdir="/workspace",
-            env={"PERSISTENT": "one"},
-        ),
-        client=client,
-        environment_class=DurableHypemanEnvironment,
     )
     environment._instance_id = "instance-1"
     execute = AsyncMock(
@@ -406,7 +345,7 @@ async def test_durable_exec_detaches_and_reconnects_while_polling(
     monkeypatch.setattr(
         environment_module.uuid,
         "uuid4",
-        lambda: SimpleNamespace(hex="durable-job"),
+        lambda: SimpleNamespace(hex="exec-job"),
     )
 
     result = await environment.exec(
@@ -443,13 +382,7 @@ async def test_durable_exec_detaches_and_reconnects_while_polling(
 async def test_control_reconnect_window_starts_after_transfer_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    environment = cast(
-        DurableHypemanEnvironment,
-        _environment(
-            tmp_path,
-            environment_class=DurableHypemanEnvironment,
-        ),
-    )
+    environment = _environment(tmp_path)
     environment._instance_id = "instance-1"
     original_sleep = environment_module.asyncio.sleep
     calls = 0
@@ -463,8 +396,8 @@ async def test_control_reconnect_window_starts_after_transfer_failure(
         return SimpleNamespace(output=b"done", exit_code=0)
 
     monkeypatch.setattr(environment_module, "exec_async", execute)
-    monkeypatch.setattr(environment_module, "_DURABLE_EXEC_RECONNECT_TIMEOUT_SEC", 0.01)
-    monkeypatch.setattr(environment_module, "_DURABLE_EXEC_POLL_INTERVAL_SEC", 0)
+    monkeypatch.setattr(environment_module, "_EXEC_RECONNECT_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(environment_module, "_EXEC_POLL_INTERVAL_SEC", 0)
 
     result = await environment._control_exec("true", retry=True, timeout=None)
 
@@ -472,13 +405,10 @@ async def test_control_reconnect_window_starts_after_transfer_failure(
     assert calls == 2
 
 
-async def test_durable_exec_terminates_detached_job_on_timeout(
+async def test_exec_terminates_detached_job_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    environment = _environment(
-        tmp_path,
-        environment_class=DurableHypemanEnvironment,
-    )
+    environment = _environment(tmp_path)
     environment._instance_id = "instance-1"
     execute = AsyncMock(
         side_effect=[

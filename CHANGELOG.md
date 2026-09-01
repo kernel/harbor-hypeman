@@ -4,9 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-### Added
+## [0.1.2] - 2026-09-01
 
-- Add a durable environment that keeps commands running across temporary Hypeman control-plane interruptions.
+### Changed
+
+- Keep commands running across temporary Hypeman control-plane interruptions.
 
 ## [0.1.1] - 2026-08-21
 
@@ -24,6 +26,7 @@ All notable changes to this project are documented in this file.
 - Instance lifecycle, command execution, and file transfer support.
 - CPU, memory, storage, and network configuration.
 
-[Unreleased]: https://github.com/kernel/harbor-hypeman/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kernel/harbor-hypeman/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/kernel/harbor-hypeman/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kernel/harbor-hypeman/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kernel/harbor-hypeman/releases/tag/v0.1.0
