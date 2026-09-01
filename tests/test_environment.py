@@ -440,6 +440,38 @@ async def test_durable_exec_detaches_and_reconnects_while_polling(
     assert sleep.await_count == 2
 
 
+async def test_control_reconnect_window_starts_after_transfer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = cast(
+        DurableHypemanEnvironment,
+        _environment(
+            tmp_path,
+            environment_class=DurableHypemanEnvironment,
+        ),
+    )
+    environment._instance_id = "instance-1"
+    original_sleep = environment_module.asyncio.sleep
+    calls = 0
+
+    async def execute(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await original_sleep(0.02)
+            raise ConnectionRefusedError("control connection closed")
+        return SimpleNamespace(output=b"done", exit_code=0)
+
+    monkeypatch.setattr(environment_module, "exec_async", execute)
+    monkeypatch.setattr(environment_module, "_DURABLE_EXEC_RECONNECT_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(environment_module, "_DURABLE_EXEC_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._control_exec("true", retry=True, timeout=None)
+
+    assert result.output == b"done"
+    assert calls == 2
+
+
 async def test_durable_exec_terminates_detached_job_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

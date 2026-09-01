@@ -448,9 +448,7 @@ class DurableHypemanEnvironment(HypemanEnvironment):
         retry: bool = False,
         timeout: int | None = 10,
     ) -> Any:
-        deadline = (
-            asyncio.get_running_loop().time() + _DURABLE_EXEC_RECONNECT_TIMEOUT_SEC
-        )
+        reconnect_deadline: float | None = None
         while True:
             try:
                 return await exec_async(
@@ -461,11 +459,12 @@ class DurableHypemanEnvironment(HypemanEnvironment):
                     timeout=timeout,
                 )
             except Exception as error:
-                if (
-                    not retry
-                    or not self._is_transient_control_error(error)
-                    or asyncio.get_running_loop().time() >= deadline
-                ):
+                if not retry or not self._is_transient_control_error(error):
+                    raise
+                now = asyncio.get_running_loop().time()
+                if reconnect_deadline is None:
+                    reconnect_deadline = now + _DURABLE_EXEC_RECONNECT_TIMEOUT_SEC
+                if now >= reconnect_deadline:
                     raise
                 await asyncio.sleep(_DURABLE_EXEC_POLL_INTERVAL_SEC)
 
