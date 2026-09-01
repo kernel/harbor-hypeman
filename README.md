@@ -29,6 +29,20 @@ harbor run \
   --env harbor_hypeman:HypemanEnvironment
 ```
 
+For agents or verifiers that run for minutes, use the durable environment:
+
+```bash
+harbor run \
+  --dataset terminal-bench@2.0 \
+  --agent codex \
+  --model openai/gpt-5.6 \
+  --env harbor_hypeman:DurableHypemanEnvironment
+```
+
+It launches each command as a detached job inside the VM and uses short Hypeman
+exec calls to poll its status. The command and VM continue running when the
+Hypeman control plane reconnects during a deployment.
+
 The backend supports task environments defined by either:
 
 - `[environment].docker_image` in `task.toml`
@@ -39,7 +53,8 @@ CPU, memory, and storage values map to Hypeman vCPUs, base memory, and writable 
 ## Behavior
 
 - Dockerfile builds are cached by Harbor environment content hash and rebuilt with `--force-build`.
-- Commands execute once through Hypeman's WebSocket API; transport failures after dispatch are not retried.
+- `HypemanEnvironment` executes commands once through Hypeman's WebSocket API; transport failures after dispatch are not retried.
+- `DurableHypemanEnvironment` detaches commands inside the VM, polls them with short exec calls, and tolerates control-plane interruptions of up to 60 seconds.
 - Hypeman currently returns merged stdout/stderr. Harbor receives that output as `stdout` and `stderr=None`.
 - Uploads and downloads use Hypeman's archive-aware WebSocket copy API.
 - `stop(delete=False)` stops and preserves the instance; `stop(delete=True)` deletes it.
