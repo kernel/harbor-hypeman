@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add a durable environment that keeps commands running across temporary Hypeman control-plane interruptions.
+
 ## [0.1.1] - 2026-08-21
 
 ### Fixed

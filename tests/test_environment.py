@@ -10,15 +10,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from harbor.environments.base import SandboxBuildFailedError
+from harbor.environments.base import ExecResult, SandboxBuildFailedError
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.config import EnvironmentConfig as TrialEnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 from hypeman import AsyncHypeman, NotFoundError
+from hypeman.lib import ExecProtocolError
 
 import harbor_hypeman.environment as environment_module
-from harbor_hypeman import HypemanEnvironment
+from harbor_hypeman import DurableHypemanEnvironment, HypemanEnvironment
 
 
 def _client() -> Any:
@@ -48,6 +49,7 @@ def _environment(
     network_policy: NetworkPolicy | None = None,
     client: Any | None = None,
     dockerfile: str | None = None,
+    environment_class: type[HypemanEnvironment] = HypemanEnvironment,
 ) -> HypemanEnvironment:
     environment_dir = tmp_path / "environment"
     environment_dir.mkdir()
@@ -55,7 +57,7 @@ def _environment(
         (environment_dir / "Dockerfile").write_text(dockerfile)
     trial_paths = TrialPaths(tmp_path / "trial")
     trial_paths.mkdir()
-    return HypemanEnvironment(
+    return environment_class(
         environment_dir=environment_dir,
         environment_name="test-task",
         session_id="Test_Task__abc123__env",
@@ -85,6 +87,17 @@ def test_custom_environment_loads_from_import_path(tmp_path: Path) -> None:
 
     assert isinstance(result, HypemanEnvironment)
     assert result.type() == "hypeman"
+
+    durable = EnvironmentFactory.create_environment_from_config(
+        TrialEnvironmentConfig(import_path="harbor_hypeman:DurableHypemanEnvironment"),
+        environment_dir=environment_dir,
+        environment_name="test-task",
+        session_id="durable-session",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(docker_image="alpine:latest"),
+        hypeman_client=cast(AsyncHypeman, _client()),
+    )
+    assert isinstance(durable, DurableHypemanEnvironment)
 
 
 def test_capabilities_cover_limits_and_static_no_network(tmp_path: Path) -> None:
@@ -360,6 +373,98 @@ async def test_exec_uses_shell_workdir_environment_and_user(
         "env": {"PERSISTENT": "one", "PER_COMMAND": "two"},
         "timeout": 15,
     }
+
+
+async def test_durable_exec_detaches_and_reconnects_while_polling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client()
+    environment = _environment(
+        tmp_path,
+        task_config=EnvironmentConfig(
+            docker_image="alpine:latest",
+            workdir="/workspace",
+            env={"PERSISTENT": "one"},
+        ),
+        client=client,
+        environment_class=DurableHypemanEnvironment,
+    )
+    environment._instance_id = "instance-1"
+    execute = AsyncMock(
+        side_effect=[
+            SimpleNamespace(output=b"", exit_code=0),
+            SimpleNamespace(output=b"", exit_code=1),
+            ExecProtocolError("control connection closed"),
+            SimpleNamespace(output=b"", exit_code=0),
+            SimpleNamespace(output=b"combined output\n", exit_code=7),
+            SimpleNamespace(output=b"", exit_code=0),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(environment_module, "exec_async", execute)
+    monkeypatch.setattr(environment_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        environment_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="durable-job"),
+    )
+
+    result = await environment.exec(
+        "printf test",
+        env={"PER_COMMAND": "two"},
+        user="agent",
+    )
+
+    assert result == ExecResult(stdout="combined output\n", stderr=None, return_code=7)
+    assert execute.await_count == 6
+    launch = execute.await_args_list[0]
+    launch_command = launch.args[2][2]
+    assert "nohup setsid /bin/bash" in launch_command
+    assert "su agent -s /bin/sh -c" in launch_command
+    assert "printf test" in launch_command
+    assert launch.kwargs == {
+        "cwd": "/workspace",
+        "env": {"PERSISTENT": "one", "PER_COMMAND": "two"},
+        "timeout": 10,
+    }
+    assert all(
+        call.kwargs == {"cwd": "/", "timeout": 10}
+        for call in execute.await_args_list[1:]
+    )
+    assert sleep.await_count == 2
+
+
+async def test_durable_exec_terminates_detached_job_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(
+        tmp_path,
+        environment_class=DurableHypemanEnvironment,
+    )
+    environment._instance_id = "instance-1"
+    execute = AsyncMock(
+        side_effect=[
+            SimpleNamespace(output=b"", exit_code=0),
+            SimpleNamespace(output=b"", exit_code=0),
+            SimpleNamespace(output=b"partial output", exit_code=0),
+            SimpleNamespace(output=b"", exit_code=0),
+        ]
+    )
+    monkeypatch.setattr(environment_module, "exec_async", execute)
+    monkeypatch.setattr(
+        environment_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="timed-out-job"),
+    )
+
+    result = await environment.exec("sleep 60", timeout_sec=0)
+
+    assert result == ExecResult(stdout="partial output", stderr=None, return_code=124)
+    assert execute.await_count == 4
+    terminate_command = execute.await_args_list[1].args[2][2]
+    assert 'kill -TERM -- "-$pid"' in terminate_command
+    cleanup_command = execute.await_args_list[3].args[2][2]
+    assert "rm -rf /tmp/harbor-hypeman-exec/timed-out-job" in cleanup_command
 
 
 async def test_file_transfers_preserve_harbor_target_semantics(

@@ -8,6 +8,7 @@ import shlex
 import shutil
 import tarfile
 import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, override
 
@@ -28,8 +29,15 @@ from harbor.environments.definition import (
 )
 from harbor.models.task.config import EnvironmentConfig, NetworkMode
 from harbor.models.trial.paths import TrialPaths
-from hypeman import AsyncHypeman, NotFoundError, omit
+from hypeman import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncHypeman,
+    NotFoundError,
+    omit,
+)
 from hypeman.lib import (
+    ExecProtocolError,
     cp_from_instance_async,
     cp_to_instance_async,
     exec_async,
@@ -38,6 +46,9 @@ from pathspec import GitIgnoreSpec
 
 _BUILD_TAG = "harbor.environment_id"
 _TERMINAL_BUILD_STATES = frozenset({"failed", "cancelled"})
+_DURABLE_EXEC_ROOT = "/tmp/harbor-hypeman-exec"
+_DURABLE_EXEC_POLL_INTERVAL_SEC = 1.0
+_DURABLE_EXEC_RECONNECT_TIMEOUT_SEC = 60.0
 
 
 class HypemanEnvironment(BaseEnvironment):
@@ -303,6 +314,30 @@ class HypemanEnvironment(BaseEnvironment):
             raise RuntimeError("Hypeman environment has not been started.")
         return self._instance_id
 
+    def _exec_command(self, command: str, user: str | int | None) -> str:
+        user = self._resolve_user(user)
+        if user in (None, "root", 0):
+            return command
+        if isinstance(user, int):
+            user_name = f"$(getent passwd {user} | cut -d: -f1)"
+        else:
+            user_name = shlex.quote(user)
+        return f"su {user_name} -s /bin/sh -c {shlex.quote(command)}"
+
+    def _exec_cwd(self, cwd: str | None) -> str | None:
+        return effective_exec_cwd(
+            cwd,
+            self.task_env_config.workdir,
+            self._dockerfile_workdir,
+        )
+
+    async def _exec_result(self, result: Any) -> ExecResult:
+        output = result.output.decode("utf-8", errors="replace")
+        callback = self._output_callback()
+        if callback is not None and output:
+            await callback(output, "stdout")
+        return ExecResult(stdout=output, stderr=None, return_code=result.exit_code)
+
     @override
     async def exec(
         self,
@@ -312,31 +347,15 @@ class HypemanEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        user = self._resolve_user(user)
-        if user not in (None, "root", 0):
-            if isinstance(user, int):
-                user_name = f"$(getent passwd {user} | cut -d: -f1)"
-            else:
-                user_name = shlex.quote(user)
-            command = f"su {user_name} -s /bin/sh -c {shlex.quote(command)}"
-
         result = await exec_async(
             self._client,
             self._require_instance(),
-            ["/bin/bash", "-lc", command],
-            cwd=effective_exec_cwd(
-                cwd,
-                self.task_env_config.workdir,
-                self._dockerfile_workdir,
-            ),
+            ["/bin/bash", "-lc", self._exec_command(command, user)],
+            cwd=self._exec_cwd(cwd),
             env=self._merge_env(env),
             timeout=timeout_sec,
         )
-        output = result.output.decode("utf-8", errors="replace")
-        callback = self._output_callback()
-        if callback is not None and output:
-            await callback(output, "stdout")
-        return ExecResult(stdout=output, stderr=None, return_code=result.exit_code)
+        return await self._exec_result(result)
 
     @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -398,3 +417,190 @@ class HypemanEnvironment(BaseEnvironment):
                     f"{source_dir!r}."
                 )
             shutil.copytree(downloaded, target, dirs_exist_ok=True)
+
+
+class DurableHypemanEnvironment(HypemanEnvironment):
+    """Run commands independently of their Hypeman exec WebSocket."""
+
+    @staticmethod
+    def _is_transient_control_error(error: BaseException) -> bool:
+        current: BaseException | None = error
+        while current is not None:
+            if isinstance(
+                current,
+                (APIConnectionError, APITimeoutError, ExecProtocolError, OSError),
+            ):
+                return True
+            if current.__class__.__name__ in {
+                "ConnectionClosed",
+                "ConnectionClosedError",
+            }:
+                return True
+            if current.__class__.__name__ in {"InvalidStatus", "InvalidStatusCode"}:
+                return any(code in str(current) for code in ("502", "503", "504"))
+            current = current.__cause__ or current.__context__
+        return False
+
+    async def _control_exec(self, command: str, *, retry: bool = False) -> Any:
+        deadline = (
+            asyncio.get_running_loop().time() + _DURABLE_EXEC_RECONNECT_TIMEOUT_SEC
+        )
+        while True:
+            try:
+                return await exec_async(
+                    self._client,
+                    self._require_instance(),
+                    ["/bin/bash", "-lc", command],
+                    cwd="/",
+                    timeout=10,
+                )
+            except Exception as error:
+                if (
+                    not retry
+                    or not self._is_transient_control_error(error)
+                    or asyncio.get_running_loop().time() >= deadline
+                ):
+                    raise
+                await asyncio.sleep(_DURABLE_EXEC_POLL_INTERVAL_SEC)
+
+    @staticmethod
+    def _job_paths(job_id: str) -> tuple[str, str, str, str]:
+        job_dir = f"{_DURABLE_EXEC_ROOT}/{job_id}"
+        return (
+            job_dir,
+            f"{job_dir}/pid",
+            f"{job_dir}/output",
+            f"{job_dir}/exit-code",
+        )
+
+    async def _terminate_job(self, job_dir: str, pid_path: str) -> None:
+        command = f"""
+if [ -s {shlex.quote(pid_path)} ]; then
+  pid=$(cat {shlex.quote(pid_path)})
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.2
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+fi
+"""
+        try:
+            await self._control_exec(command)
+        except Exception:
+            self.logger.warning("Failed to terminate durable exec job %s", job_dir)
+
+    async def _read_job_result(
+        self,
+        job_dir: str,
+        output_path: str,
+        exit_path: str,
+        return_code: int | None = None,
+    ) -> ExecResult:
+        if return_code is None:
+            command = f"""
+status=$(cat {shlex.quote(exit_path)})
+[ ! -f {shlex.quote(output_path)} ] || cat {shlex.quote(output_path)}
+exit "$status"
+"""
+        else:
+            command = (
+                f"[ ! -f {shlex.quote(output_path)} ] || cat {shlex.quote(output_path)}"
+            )
+        result = await self._control_exec(command, retry=True)
+        exec_result = await self._exec_result(result)
+        if return_code is not None:
+            exec_result = ExecResult(
+                stdout=exec_result.stdout,
+                stderr=exec_result.stderr,
+                return_code=return_code,
+            )
+        try:
+            await self._control_exec(f"rm -rf {shlex.quote(job_dir)}", retry=True)
+        except Exception:
+            self.logger.warning("Failed to remove durable exec job %s", job_dir)
+        return exec_result
+
+    @override
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        command = self._exec_command(command, user)
+        job_id = uuid.uuid4().hex
+        job_dir, pid_path, output_path, exit_path = self._job_paths(job_id)
+        worker = f"""
+set +e
+/bin/bash -lc {shlex.quote(command)}
+status=$?
+printf '%s\\n' "$status" > {shlex.quote(exit_path)}.tmp
+mv {shlex.quote(exit_path)}.tmp {shlex.quote(exit_path)}
+exit "$status"
+"""
+        launcher = f"""
+set -eu
+umask 077
+mkdir -p {shlex.quote(_DURABLE_EXEC_ROOT)}
+mkdir {shlex.quote(job_dir)}
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid /bin/bash -c {shlex.quote(worker)} \
+    > {shlex.quote(output_path)} 2>&1 </dev/null &
+else
+  nohup /bin/bash -c {shlex.quote(worker)} \
+    > {shlex.quote(output_path)} 2>&1 </dev/null &
+fi
+printf '%s\\n' "$!" > {shlex.quote(pid_path)}
+"""
+
+        launched = False
+        try:
+            await exec_async(
+                self._client,
+                self._require_instance(),
+                ["/bin/bash", "-lc", launcher],
+                cwd=self._exec_cwd(cwd),
+                env=self._merge_env(env),
+                timeout=10,
+            )
+            launched = True
+            deadline = (
+                asyncio.get_running_loop().time() + timeout_sec
+                if timeout_sec is not None
+                else None
+            )
+            poll = f"""
+if [ -f {shlex.quote(exit_path)} ]; then
+  exit 0
+fi
+if [ -s {shlex.quote(pid_path)} ] \
+    && kill -0 "$(cat {shlex.quote(pid_path)})" 2>/dev/null; then
+  exit 1
+fi
+exit 2
+"""
+            while True:
+                if (
+                    deadline is not None
+                    and asyncio.get_running_loop().time() >= deadline
+                ):
+                    await self._terminate_job(job_dir, pid_path)
+                    return await self._read_job_result(
+                        job_dir, output_path, exit_path, return_code=124
+                    )
+                status = await self._control_exec(poll, retry=True)
+                if status.exit_code == 0:
+                    return await self._read_job_result(job_dir, output_path, exit_path)
+                if status.exit_code == 2:
+                    raise RuntimeError(
+                        f"Durable exec job {job_id} exited without recording a status"
+                    )
+                await asyncio.sleep(_DURABLE_EXEC_POLL_INTERVAL_SEC)
+        except BaseException:
+            if launched:
+                await self._terminate_job(job_dir, pid_path)
+                try:
+                    await self._control_exec(f"rm -rf {shlex.quote(job_dir)}")
+                except Exception:
+                    self.logger.warning("Failed to remove durable exec job %s", job_dir)
+            raise
